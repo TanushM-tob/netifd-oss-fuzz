@@ -1,0 +1,197 @@
+#!/usr/bin/make -f
+
+# AFL++ Makefile for netifd fuzzer
+# Heavily inspired by mdnsd-oss-fuzz/Makefile.afl
+
+# -----------------------------------------------------------------------------
+# 1. Compiler detection (afl-clang-lto ▸ afl-clang-fast ▸ afl-gcc)
+# -----------------------------------------------------------------------------
+CC := afl-clang-lto
+ifeq ($(shell which afl-clang-lto 2>/dev/null),)
+  CC := afl-clang-fast
+  ifeq ($(shell which afl-clang-fast 2>/dev/null),)
+    CC := afl-gcc
+  endif
+endif
+
+# -----------------------------------------------------------------------------
+# 2. Global paths & flags
+# -----------------------------------------------------------------------------
+export DEPS_DIR := $(abspath $(CURDIR)/deps)
+export INSTALL_PREFIX := $(DEPS_DIR)/install
+CFLAGS := -O2 -fPIC -std=gnu99 -g -Wall -Wno-c23-extensions -D_GNU_SOURCE -DDUMMY_MODE=1 -DDEBUG
+LDFLAGS :=
+
+INCLUDE_DIRS := -I$(INSTALL_PREFIX)/include -I$(CURDIR)
+LIB_DIRS     := -L$(INSTALL_PREFIX)/lib
+
+# -----------------------------------------------------------------------------
+# 3. Source lists
+# -----------------------------------------------------------------------------
+NETIFD_SRC := \
+  utils.c system.c system-dummy.c tunnel.c handler.c \
+  interface.c interface-ip.c interface-event.c \
+  iprule.c proto.c proto-static.c proto-shell.c \
+  config.c device.c bridge.c veth.c vlan.c alias.c \
+  macvlan.c ubus.c vlandev.c wireless.c \
+  extdev.c bonding.c vrf.c missing_syms.c
+
+NETIFD_OBJ := $(NETIFD_SRC:.c=.o)
+
+MAIN_WRAPPER_C := main_wrapper.c
+MAIN_WRAPPER_O := main_wrapper.o
+
+FUZZER_SRC   := netifd_fuzz.c
+FUZZER_OBJ   := $(FUZZER_SRC:.c=.o)
+FUZZER_BIN   := netifd_afl_fuzzer
+
+# -----------------------------------------------------------------------------
+# 4. Top-level targets
+# -----------------------------------------------------------------------------
+.PHONY: all deps clean distclean testcases fuzz help
+
+all: deps $(FUZZER_BIN)
+
+# -----------------------------------------------------------------------------
+# 5. Dependency targets (libubox, libuci, libnl-tiny, ubus + headers)
+# -----------------------------------------------------------------------------
+DEPS_LIBS := \
+  $(INSTALL_PREFIX)/lib/libubox.a \
+  $(INSTALL_PREFIX)/lib/libuci.a \
+  $(INSTALL_PREFIX)/lib/libnl-tiny.a \
+  $(INSTALL_PREFIX)/lib/libubus.a \
+  $(INSTALL_PREFIX)/include/udebug.h
+
+deps: $(DEPS_LIBS)
+	@echo "✓ All dependencies built"
+
+# ---- libubox -----------------------------------------------------------------
+$(INSTALL_PREFIX)/lib/libubox.a:
+	@echo "[libubox] Cloning & building..."
+	@mkdir -p $(DEPS_DIR)
+	@if [ ! -d "$(DEPS_DIR)/libubox" ]; then \
+		cd $(DEPS_DIR) && git clone --depth 1 https://github.com/openwrt/libubox.git; \
+	fi
+	@cd $(DEPS_DIR)/libubox && rm -rf tests examples lua || true
+	@cd $(DEPS_DIR)/libubox && sed -i '/[Aa][Dd][Dd]_SUBDIRECTORY.*examples/d' CMakeLists.txt || true
+	@cd $(DEPS_DIR)/libubox && sed -i '/[Aa][Dd][Dd]_SUBDIRECTORY.*lua/d' CMakeLists.txt || true
+	@cd $(DEPS_DIR)/libubox && \
+		mkdir -p build && cd build && \
+		cmake .. -DCMAKE_INSTALL_PREFIX="$(INSTALL_PREFIX)" \
+		         -DCMAKE_C_COMPILER="$(CC)" \
+		         -DCMAKE_C_FLAGS="-O2 -fPIC -g" \
+		         -DBUILD_LUA=OFF -DBUILD_EXAMPLES=OFF -DBUILD_TESTS=OFF \
+		         -DBUILD_STATIC=ON  -DBUILD_SHARED_LIBS=OFF && \
+		make -j$$(nproc) && make install
+
+# ---- libuci ------------------------------------------------------------------
+$(INSTALL_PREFIX)/lib/libuci.a: $(INSTALL_PREFIX)/lib/libubox.a
+	@echo "[libuci] Cloning & building..."
+	@if [ ! -d "$(DEPS_DIR)/uci" ]; then \
+		cd $(DEPS_DIR) && git clone --depth 1 https://git.openwrt.org/project/uci.git; \
+	fi
+	@cd $(DEPS_DIR)/uci && rm -rf tests || true
+	@cd $(DEPS_DIR)/uci && \
+		mkdir -p build && cd build && \
+		cmake .. -DCMAKE_INSTALL_PREFIX="$(INSTALL_PREFIX)" \
+		         -DCMAKE_C_COMPILER="$(CC)" \
+		         -DCMAKE_C_FLAGS="-O2 -fPIC -g" \
+		         -DBUILD_LUA=OFF -DBUILD_TESTS=OFF \
+		         -DBUILD_STATIC=ON  -DBUILD_SHARED_LIBS=OFF \
+		         -DCMAKE_POSITION_INDEPENDENT_CODE=ON && \
+		make -j$$(nproc) && make install
+
+# ---- libnl-tiny --------------------------------------------------------------
+$(INSTALL_PREFIX)/lib/libnl-tiny.a:
+	@echo "[libnl-tiny] Cloning & building..."
+	@if [ ! -d "$(DEPS_DIR)/libnl-tiny" ]; then \
+		cd $(DEPS_DIR) && git clone --depth 1 https://git.openwrt.org/project/libnl-tiny.git; \
+	fi
+	@cd $(DEPS_DIR)/libnl-tiny && rm -rf tests || true
+	@cd $(DEPS_DIR)/libnl-tiny && \
+		mkdir -p build && cd build && \
+		cmake .. -DCMAKE_INSTALL_PREFIX="$(INSTALL_PREFIX)" \
+		         -DCMAKE_C_COMPILER="$(CC)" \
+		         -DCMAKE_C_FLAGS="-O2 -fPIC -g" \
+		         -DBUILD_TESTS=OFF -DBUILD_SHARED_LIBS=OFF && \
+		make -j$$(nproc) && make install
+
+# ---- ubus --------------------------------------------------------------------
+$(INSTALL_PREFIX)/lib/libubus.a: $(INSTALL_PREFIX)/lib/libubox.a
+	@echo "[ubus] Cloning & building..."
+	@if [ ! -d "$(DEPS_DIR)/ubus" ]; then \
+		cd $(DEPS_DIR) && git clone --depth 1 https://git.openwrt.org/project/ubus.git; \
+	fi
+	@cd $(DEPS_DIR)/ubus && rm -rf tests examples lua || true
+	@cd $(DEPS_DIR)/ubus && sed -i '/[Aa][Dd][Dd]_SUBDIRECTORY.*examples/d' CMakeLists.txt || true
+	@cd $(DEPS_DIR)/ubus && sed -i '/[Aa][Dd][Dd]_SUBDIRECTORY.*lua/d' CMakeLists.txt || true
+	@cd $(DEPS_DIR)/ubus && \
+		mkdir -p build && cd build && \
+		cmake .. -DCMAKE_INSTALL_PREFIX="$(INSTALL_PREFIX)" \
+		         -DCMAKE_C_COMPILER="$(CC)" \
+		         -DCMAKE_C_FLAGS="-O2 -fPIC -g" \
+		         -DBUILD_LUA=OFF -DBUILD_EXAMPLES=OFF -DBUILD_TESTS=OFF \
+		         -DBUILD_STATIC=ON  -DBUILD_SHARED_LIBS=OFF && \
+		make -j$$(nproc) && make install
+
+# ---- udebug header only ------------------------------------------------------
+$(INSTALL_PREFIX)/include/udebug.h:
+	@echo "[udebug] Fetching header..."
+	@mkdir -p $(INSTALL_PREFIX)/include
+	@if [ ! -f "$(DEPS_DIR)/udebug/udebug.h" ]; then \
+		cd $(DEPS_DIR) && git clone --depth 1 https://github.com/openwrt/udebug.git || true; \
+	fi
+	@cp -f $(DEPS_DIR)/udebug/udebug.h $(INSTALL_PREFIX)/include/udebug.h
+	@# Safety: remove problematic strlcpy redeclaration if present
+	@sed -i '/strlcpy(/d' $(INSTALL_PREFIX)/include/udebug.h
+
+# -----------------------------------------------------------------------------
+# 6. Helper rule – generate main wrapper that disables original main()
+# -----------------------------------------------------------------------------
+$(MAIN_WRAPPER_C): main.c
+	echo '#define main disabled_main' > $@
+	cat $< >> $@
+	echo '#undef main' >> $@
+
+$(MAIN_WRAPPER_O): $(MAIN_WRAPPER_C) deps
+	$(CC) $(CFLAGS) $(INCLUDE_DIRS) -c $< -o $@
+
+# -----------------------------------------------------------------------------
+# 7. Object compilation rules
+# -----------------------------------------------------------------------------
+%.o: %.c deps
+	@sed -i '/strlcpy(/d' $(INSTALL_PREFIX)/include/udebug.h || true
+	$(CC) $(CFLAGS) $(INCLUDE_DIRS) -c $< -o $@
+
+$(FUZZER_OBJ): $(FUZZER_SRC) deps
+	$(CC) $(CFLAGS) $(INCLUDE_DIRS) -c $< -o $@
+
+# -----------------------------------------------------------------------------
+# 8. Linking
+# -----------------------------------------------------------------------------
+$(FUZZER_BIN): $(NETIFD_OBJ) $(MAIN_WRAPPER_O) $(FUZZER_OBJ)
+	@echo "[Link] Creating AFL++ fuzzer binary..."
+	$(CC) $(CFLAGS) $(NETIFD_OBJ) $(MAIN_WRAPPER_O) $(FUZZER_OBJ) \
+		$(LIB_DIRS) $(LDFLAGS) \
+		-lubox -luci -lnl-tiny -lubus -lblobmsg_json -ljson-c -lresolv \
+		-o $@
+	@echo "✓ Built fuzzer: $@"
+
+# -----------------------------------------------------------------------------
+# 9. Convenience targets
+# -----------------------------------------------------------------------------
+clean:
+	rm -f $(NETIFD_OBJ) $(MAIN_WRAPPER_O) $(FUZZER_OBJ) $(FUZZER_BIN) $(MAIN_WRAPPER_C)
+
+
+distclean: clean
+	rm -rf $(DEPS_DIR)
+
+help:
+	@echo "AFL++ netifd Fuzzer Makefile"
+	@echo "Targets:"
+	@echo "  all         - Build dependencies and fuzzer (default)"
+	@echo "  deps        - Build dependencies only"
+	@echo "  clean       - Remove build artifacts"
+	@echo "  distclean   - Remove build artifacts and dependencies"
+	@echo "  help        - Show this message" 
