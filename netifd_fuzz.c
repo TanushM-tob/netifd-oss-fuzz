@@ -94,6 +94,13 @@ static void init_netifd_for_fuzzing(void) {
     
     g_fuzzing_mode = true;
     
+    // Initialize the global interfaces vlist - this is critical!
+    extern struct vlist_tree interfaces;
+    extern void interface_update(struct vlist_tree *tree, struct vlist_node *node_new, struct vlist_node *node_old);
+    vlist_init(&interfaces, avl_strcmp, interface_update);
+    interfaces.keep_old = true;
+    interfaces.no_delete = true;
+    
     extern int netifd_ubus_init(const char *path);
     netifd_ubus_init("/tmp/dummy_ubus_socket");
     
@@ -264,27 +271,51 @@ static void fuzz_with_reduced_requirements(const uint8_t *data, size_t size) {
 }
 
 static struct interface *create_fuzzed_interface(const uint8_t *data, size_t size, size_t *offset) {
-    if (*offset + sizeof(struct interface) > size) return NULL;
+    if (*offset + 8 > size) return NULL;
     
     struct interface *iface = calloc(1, sizeof(struct interface));
     if (!iface) return NULL;
     
-    memcpy(iface, data + *offset, sizeof(struct interface));
-    *offset += sizeof(struct interface);
+    // Only copy safe scalar fields from fuzz data - using actual struct fields
+    if (*offset + 8 <= size) {
+        iface->autostart = data[*offset] & 1;
+        iface->force_link = data[*offset + 1] & 1;
+        iface->dynamic = data[*offset + 2] & 1;
+        iface->enabled = data[*offset + 3] & 1;
+        iface->dns_metric = data[*offset + 4] % 1000;
+        iface->metric = data[*offset + 5] % 1000;
+        *offset += 6; // Only advance by what we actually used
+    } else {
+        *offset += sizeof(struct interface); // Skip if not enough data
+    }
     
     static const char *safe_names[] = {"eth0", "wlan0", "br0", "fuzz_if"};
-    iface->name = safe_names[((uintptr_t)iface->name) % 4];
+    size_t name_idx = 0;
+    if (*offset > 0) name_idx = data[*offset - 1] % 4;
+    iface->name = safe_names[name_idx];
     
     INIT_LIST_HEAD(&iface->errors);
     INIT_LIST_HEAD(&iface->users);
     INIT_LIST_HEAD(&iface->assignment_classes);
+    INIT_LIST_HEAD(&iface->hotplug_list);
     
+    // Initialize all vlist and avl trees properly
     memset(&iface->config_ip, 0, sizeof(iface->config_ip));
     memset(&iface->proto_ip, 0, sizeof(iface->proto_ip));
     
-    vlist_init(&iface->proto_ip.addr, avl_strcmp, NULL);
-    vlist_init(&iface->proto_ip.route, avl_strcmp, NULL);
-    vlist_init(&iface->proto_ip.prefix, avl_strcmp, NULL);
+    // Use the proper interface_ip_init function instead of manual initialization
+    extern void interface_ip_init(struct interface *iface);
+    interface_ip_init(iface);
+    avl_init(&iface->data, avl_strcmp, false, NULL);
+    
+    // Initialize timeout structure
+    memset(&iface->remove_timer, 0, sizeof(iface->remove_timer));
+    
+    // Set safe defaults for critical pointers
+    iface->proto_handler = NULL;
+    iface->proto = NULL;
+    iface->config = NULL;
+    iface->tags = NULL;
     
     return iface;
 }
@@ -325,8 +356,13 @@ static struct uci_section *create_fuzzed_uci_section(const uint8_t *data, size_t
     struct uci_section *section = calloc(1, sizeof(struct uci_section));
     if (!section) return NULL;
     
-    memcpy(section, data + *offset, sizeof(struct uci_section));
-    *offset += sizeof(struct uci_section);
+    // Don't copy fuzz data directly into the structure - initialize safely instead
+    if (*offset + 4 <= size) {
+        // Use fuzz data to select safe values, but don't copy directly
+        *offset += 4; // Consume some fuzz data for selection
+    } else {
+        *offset += sizeof(struct uci_section); // Skip if not enough data
+    }
     
     static const char *safe_types[] = {
         "interface", "route", "route6", "rule", "rule6", 
@@ -334,8 +370,15 @@ static struct uci_section *create_fuzzed_uci_section(const uint8_t *data, size_t
     };
     static const char *safe_names[] = {"lan", "wan", "wlan", "test_section"};
     
-    section->type = (char *)safe_types[((uintptr_t)section->type) % 9];
-    section->e.name = (char *)safe_names[((uintptr_t)section->e.name) % 4];
+    // Use fuzz data to select types and names safely
+    size_t type_idx = 0, name_idx = 0;
+    if (*offset > 0) {
+        type_idx = data[*offset - 4] % 9;
+        name_idx = data[*offset - 3] % 4;
+    }
+    
+    section->type = (char *)safe_types[type_idx];
+    section->e.name = (char *)safe_names[name_idx];
     section->package = mock_pkg;
     
     section->e.list.next = &section->e.list;
@@ -352,8 +395,18 @@ static struct extdev_bridge *create_fuzzed_bridge(const uint8_t *data, size_t si
     struct extdev_bridge *bridge = calloc(1, sizeof(struct extdev_bridge));
     if (!bridge) return NULL;
     
-    memcpy(bridge, data + *offset, sizeof(struct extdev_bridge));
-    *offset += sizeof(struct extdev_bridge);
+    // Only copy safe fields, not the entire structure
+    // Copy boolean and integer fields selectively
+    if (*offset + 16 <= size) {
+        bridge->empty = data[*offset] & 1;
+        bridge->active = data[*offset + 1] & 1; 
+        bridge->force_active = data[*offset + 2] & 1;
+        bridge->n_present = data[*offset + 3] % 10;
+        bridge->n_failed = data[*offset + 4] % 10;
+        *offset += 5; // Only advance by what we actually used
+    } else {
+        *offset += sizeof(struct extdev_bridge); // Skip if not enough data
+    }
     
     static struct extdev_type mock_extdev_type = {0};
     static struct uci_blob_param_list mock_config_params = {0};
@@ -373,12 +426,18 @@ static struct extdev_bridge *create_fuzzed_bridge(const uint8_t *data, size_t si
     bridge->edev.dep_name = NULL;
     bridge->config = NULL; 
     bridge->ifnames = NULL;
+    bridge->set_state = NULL;
+    
+    // Properly initialize timeout structures - this is critical!
+    memset(&bridge->retry, 0, sizeof(bridge->retry));
+    memset(&bridge->edev.retry, 0, sizeof(bridge->edev.retry));
     
     INIT_SAFE_LIST(&bridge->edev.dev.users);
     vlist_init(&bridge->members, avl_strcmp, NULL);
     
     static const char *safe_bridge_names[] = {"br0", "br-lan", "test_br"};
-    size_t name_idx = ((uintptr_t)bridge->edev.dev.ifname) % 3;
+    size_t name_idx = 0;
+    if (*offset > 0) name_idx = data[*offset - 1] % 3;
     strcpy(bridge->edev.dev.ifname, safe_bridge_names[name_idx]);
     
     return bridge;
@@ -780,38 +839,38 @@ static void fuzz_bonding_create(const uint8_t *data, size_t size) {
 }
 
 
-// #ifndef __AFL_FUZZ_TESTCASE_LEN
+#ifndef __AFL_FUZZ_TESTCASE_LEN
 
-// ssize_t fuzz_len;
-// unsigned char fuzz_buf[1024000];
+ssize_t fuzz_len;
+unsigned char fuzz_buf[1024000];
 
-// #define __AFL_FUZZ_TESTCASE_LEN fuzz_len
-// #define __AFL_FUZZ_TESTCASE_BUF fuzz_buf  
-// #define __AFL_FUZZ_INIT() void sync(void);
-// #define __AFL_LOOP(x) \
-//     ((fuzz_len = read(0, fuzz_buf, sizeof(fuzz_buf))) > 0 ? 1 : 0)
-// #define __AFL_INIT() sync()
+#define __AFL_FUZZ_TESTCASE_LEN fuzz_len
+#define __AFL_FUZZ_TESTCASE_BUF fuzz_buf  
+#define __AFL_FUZZ_INIT() void sync(void);
+#define __AFL_LOOP(x) \
+    ((fuzz_len = read(0, fuzz_buf, sizeof(fuzz_buf))) > 0 ? 1 : 0)
+#define __AFL_INIT() sync()
 
-// #endif
+#endif
 
-// __AFL_FUZZ_INIT();
+__AFL_FUZZ_INIT();
 
-// #pragma clang optimize off
-// #pragma GCC optimize("O0")
+#pragma clang optimize off
+#pragma GCC optimize("O0")
 
-// int main(int argc, char **argv)
-// {
-//     (void)argc; (void)argv; 
+int main(int argc, char **argv)
+{
+    (void)argc; (void)argv; 
     
-//     ssize_t len;
-//     unsigned char *buf;
+    ssize_t len;
+    unsigned char *buf;
 
-//     __AFL_INIT();
-//     buf = __AFL_FUZZ_TESTCASE_BUF;
-//     while (__AFL_LOOP(INT_MAX)) {
-//         len = __AFL_FUZZ_TESTCASE_LEN;
-//         LLVMFuzzerTestOneInput(buf, (size_t)len);
-//     }
+    __AFL_INIT();
+    buf = __AFL_FUZZ_TESTCASE_BUF;
+    while (__AFL_LOOP(INT_MAX)) {
+        len = __AFL_FUZZ_TESTCASE_LEN;
+        LLVMFuzzerTestOneInput(buf, (size_t)len);
+    }
     
-//     return 0;
-// }
+    return 0;
+}

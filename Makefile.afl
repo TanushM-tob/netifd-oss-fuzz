@@ -120,7 +120,7 @@ $(INSTALL_PREFIX)/lib/libnl-tiny.a:
 $(INSTALL_PREFIX)/lib/libubus.a: $(INSTALL_PREFIX)/lib/libubox.a
 	@echo "[ubus] Cloning & building..."
 	@if [ ! -d "$(DEPS_DIR)/ubus" ]; then \
-		cd $(DEPS_DIR) && git clone --depth 1 https://git.openwrt.org/project/ubus.git; \
+		cd $(DEPS_DIR) && git clone --depth 1 https://github.com/openwrt/ubus.git; \
 	fi
 	@cd $(DEPS_DIR)/ubus && rm -rf tests examples lua || true
 	@cd $(DEPS_DIR)/ubus && sed -i '/[Aa][Dd][Dd]_SUBDIRECTORY.*examples/d' CMakeLists.txt || true
