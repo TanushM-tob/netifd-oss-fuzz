@@ -179,7 +179,6 @@ static struct blob_attr *create_valid_blob_attr(const uint8_t *data, size_t size
     return blob_data(attr_buf.head);
 }
 
-
 static void fuzz_with_reduced_requirements(const uint8_t *data, size_t size) {
     if (size < 4) return;
     
@@ -194,9 +193,15 @@ static void fuzz_with_reduced_requirements(const uint8_t *data, size_t size) {
                 size_t offset = 0;
                 struct uci_section *section = create_fuzzed_uci_section(fuzz_data, fuzz_size, &offset);
                 if (section) {
+                    // Save the original type to free it later
+                    char *original_type = (char*)section->type;
                     section->type = "route";
                     bool v6 = (fuzz_data[0] % 2) == 1;
                     config_parse_route(section, v6);
+                    // Restore and free
+                    section->type = original_type;
+                    if (section->type) free((void*)section->type);
+                    if (section->e.name) free((void*)section->e.name);
                     free(section);
                 }
             }
@@ -208,9 +213,15 @@ static void fuzz_with_reduced_requirements(const uint8_t *data, size_t size) {
                 size_t offset = 0;
                 struct uci_section *section = create_fuzzed_uci_section(fuzz_data, fuzz_size, &offset);
                 if (section) {
+                    // Save the original type to free it later
+                    char *original_type = (char*)section->type;
                     section->type = "interface";
                     bool alias = (fuzz_data[0] % 2) == 1;
                     config_parse_interface(section, alias);
+                    // Restore and free
+                    section->type = original_type;
+                    if (section->type) free((void*)section->type);
+                    if (section->e.name) free((void*)section->e.name);
                     free(section);
                 }
             }
@@ -227,6 +238,13 @@ static void fuzz_with_reduced_requirements(const uint8_t *data, size_t size) {
                         bool v6 = (fuzz_data[0] % 2) == 1;
                         interface_ip_add_route(iface, attr, v6);
                     }
+                    // Clean up interface
+                    struct interface_error *error, *tmp;
+                    list_for_each_entry_safe(error, tmp, &iface->errors, list) {
+                        list_del(&error->list);
+                        free(error);
+                    }
+                    if (iface->name) free((void*)iface->name);
                     free(iface);
                 }
             }
@@ -253,6 +271,7 @@ static void fuzz_with_reduced_requirements(const uint8_t *data, size_t size) {
                     if (attr) {
                         __bridge_reload(bridge, attr);
                     }
+                    if (bridge->config) free(bridge->config);
                     free(bridge);
                 }
             }
@@ -267,7 +286,7 @@ static struct interface *create_fuzzed_interface(const uint8_t *data, size_t siz
     struct interface *iface = calloc(1, sizeof(struct interface));
     if (!iface) return NULL;
     
-    // Only copy safe scalar fields from fuzz data - using actual struct fields
+    // Only copy safe scalar fields from fuzz data
     if (*offset + 8 <= size) {
         iface->autostart = data[*offset] & 1;
         iface->force_link = data[*offset + 1] & 1;
@@ -275,30 +294,36 @@ static struct interface *create_fuzzed_interface(const uint8_t *data, size_t siz
         iface->enabled = data[*offset + 3] & 1;
         iface->dns_metric = data[*offset + 4] % 1000;
         iface->metric = data[*offset + 5] % 1000;
-        *offset += 6; // Only advance by what we actually used
-    } else {
-        *offset += sizeof(struct interface); // Skip if not enough data
+        *offset += 6;
     }
     
-    // Create a name from fuzz data instead of using safe predefined names
-    if (*offset + 32 <= size) {
+    // Create a name from fuzz data
+    if (*offset < size) {
         size_t name_len = data[*offset] % 31; // Max 30 chars + null terminator
-        char *fuzzed_name = malloc(name_len + 2);
-        if (fuzzed_name) {
-            memcpy(fuzzed_name, data + *offset + 1, name_len);
-            fuzzed_name[name_len] = '\0';
-            // Ensure at least one printable character
-            if (name_len == 0 || fuzzed_name[0] == '\0') {
-                fuzzed_name[0] = 'f';
-                fuzzed_name[1] = '\0';
+        (*offset)++;
+        
+        if (*offset + name_len <= size) {
+            char *fuzzed_name = malloc(name_len + 1);
+            if (fuzzed_name) {
+                if (name_len > 0) {
+                    memcpy(fuzzed_name, data + *offset, name_len);
+                }
+                fuzzed_name[name_len] = '\0';
+                // Ensure at least one printable character
+                if (name_len == 0) {
+                    fuzzed_name[0] = 'f';
+                }
+                iface->name = fuzzed_name;
+                *offset += name_len;
+            } else {
+                iface->name = strdup("eth0"); // Use strdup for consistency
             }
-            iface->name = fuzzed_name;
-            *offset += name_len + 1;
         } else {
-            iface->name = "eth0"; // Fallback
+            iface->name = strdup("eth0"); // Use strdup for consistency
+            *offset = size; // Consume all remaining data
         }
     } else {
-        iface->name = "eth0"; // Fallback if not enough data
+        iface->name = strdup("eth0"); // Use strdup for consistency
     }
     
     INIT_LIST_HEAD(&iface->errors);
@@ -310,7 +335,7 @@ static struct interface *create_fuzzed_interface(const uint8_t *data, size_t siz
     memset(&iface->config_ip, 0, sizeof(iface->config_ip));
     memset(&iface->proto_ip, 0, sizeof(iface->proto_ip));
     
-    // Use the proper interface_ip_init function instead of manual initialization
+    // Use the proper interface_ip_init function
     extern void interface_ip_init(struct interface *iface);
     interface_ip_init(iface);
     avl_init(&iface->data, avl_strcmp, false, NULL);
@@ -328,7 +353,8 @@ static struct interface *create_fuzzed_interface(const uint8_t *data, size_t siz
 }
 
 static struct uci_section *create_fuzzed_uci_section(const uint8_t *data, size_t size, size_t *offset) {
-    if (*offset + sizeof(struct uci_section) > size) return NULL;
+    // Need at least 2 bytes for the length fields
+    if (*offset + 2 > size) return NULL;
     
     static struct uci_context *mock_ctx = NULL;
     static struct uci_package *mock_pkg = NULL;
@@ -363,56 +389,71 @@ static struct uci_section *create_fuzzed_uci_section(const uint8_t *data, size_t
     struct uci_section *section = calloc(1, sizeof(struct uci_section));
     if (!section) return NULL;
     
-    // Don't copy fuzz data directly into the structure - initialize safely instead
-    if (*offset + 4 <= size) {
-        // Use fuzz data to select safe values, but don't copy directly
-        *offset += 4; // Consume some fuzz data for selection
-    } else {
-        *offset += sizeof(struct uci_section); // Skip if not enough data
-    }
-    
-    // Fuzz the type and name strings instead of using safe predefined values
-    if (*offset + 64 <= size) {
-        // Fuzz the type string
-        size_t type_len = data[*offset] % 31;
-        char *fuzzed_type = malloc(type_len + 2);
-        if (fuzzed_type) {
-            memcpy(fuzzed_type, data + *offset + 1, type_len);
-            fuzzed_type[type_len] = '\0';
-            if (type_len == 0 || fuzzed_type[0] == '\0') {
-                strcpy(fuzzed_type, "interface");
-            }
-            section->type = fuzzed_type;
-            *offset += type_len + 1;
-        } else {
-            section->type = "interface";
-        }
-        
-        // Fuzz the name string
-        size_t name_len = data[*offset] % 31;
-        char *fuzzed_name = malloc(name_len + 2);
-        if (fuzzed_name) {
-            memcpy(fuzzed_name, data + *offset + 1, name_len);
-            fuzzed_name[name_len] = '\0';
-            if (name_len == 0 || fuzzed_name[0] == '\0') {
-                strcpy(fuzzed_name, "lan");
-            }
-            section->e.name = fuzzed_name;
-            *offset += name_len + 1;
-        } else {
-            section->e.name = "lan";
-        }
-    } else {
-        section->type = "interface";
-        section->e.name = "lan";
-        *offset += 4;
-    }
+    // Initialize the uci_element properly
+    section->e.type = 1;  // UCI_TYPE_SECTION
     section->package = mock_pkg;
     
+    // Initialize list heads
     section->e.list.next = &section->e.list;
     section->e.list.prev = &section->e.list;
     section->options.next = &section->options;
     section->options.prev = &section->options;
+    
+    // Fuzz the type string
+    if (*offset < size) {
+        size_t type_len = data[*offset] % 31;
+        (*offset)++;
+        
+        // Check if we have enough data for the string
+        if (*offset + type_len <= size) {
+            // Allocate memory for the string (type_len + 1 for null terminator)
+            char *fuzzed_type = malloc(type_len + 1);
+            if (fuzzed_type) {
+                if (type_len > 0) {
+                    memcpy(fuzzed_type, data + *offset, type_len);
+                }
+                fuzzed_type[type_len] = '\0';
+                section->type = fuzzed_type;
+                *offset += type_len;
+            } else {
+                section->type = strdup("interface");
+            }
+        } else {
+            // Not enough data, use default
+            section->type = strdup("interface");
+            *offset = size; // Consume all remaining data
+        }
+    } else {
+        section->type = strdup("interface");
+    }
+    
+    // Fuzz the name string
+    if (*offset < size) {
+        size_t name_len = data[*offset] % 31;
+        (*offset)++;
+        
+        // Check if we have enough data for the string
+        if (*offset + name_len <= size) {
+            // Allocate memory for the string (name_len + 1 for null terminator)
+            char *fuzzed_name = malloc(name_len + 1);
+            if (fuzzed_name) {
+                if (name_len > 0) {
+                    memcpy(fuzzed_name, data + *offset, name_len);
+                }
+                fuzzed_name[name_len] = '\0';
+                section->e.name = fuzzed_name;
+                *offset += name_len;
+            } else {
+                section->e.name = strdup("lan");
+            }
+        } else {
+            // Not enough data, use default
+            section->e.name = strdup("lan");
+            *offset = size; // Consume all remaining data
+        }
+    } else {
+        section->e.name = strdup("lan");
+    }
     
     return section;
 }
@@ -502,22 +543,34 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     
     struct uci_section *fuzz_section = create_fuzzed_uci_section(data, size, &offset);
     if (!fuzz_section) {
+        // Clean up interface
+        if (fuzz_iface->name) {
+            free((void*)fuzz_iface->name);
+        }
         free(fuzz_iface);
         return 0;
     }
     
     struct extdev_bridge *fuzz_bridge = create_fuzzed_bridge(data, size, &offset);
     if (!fuzz_bridge) {
+        // Clean up interface
+        if (fuzz_iface->name) {
+            free((void*)fuzz_iface->name);
+        }
         free(fuzz_iface);
+        // Clean up section
+        if (fuzz_section->type) {
+            free((void*)fuzz_section->type);
+        }
+        if (fuzz_section->e.name) {
+            free((void*)fuzz_section->e.name);
+        }
         free(fuzz_section);
         return 0;
     }
     
     if (offset >= size) {
-        free(fuzz_iface);
-        free(fuzz_section);
-        free(fuzz_bridge);
-        return 0;
+        goto cleanup;
     }
     
     uint8_t strategy = data[offset] % 6;
@@ -527,17 +580,18 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     size_t fuzz_size = size - offset;
     
     if (fuzz_size == 0) {
-        free(fuzz_iface);
-        free(fuzz_section);  
-        free(fuzz_bridge);
-        return 0;
+        goto cleanup;
     }
+    
+    // Save original type to restore after use
+    char *original_type = (char*)fuzz_section->type;
     
     switch (strategy) {
         case 0: {
             fuzz_section->type = "route";
             bool v6_route = (fuzz_data[0] % 2) == 1;
             config_parse_route(fuzz_section, v6_route);
+            fuzz_section->type = original_type; // Restore
             break;
         }
         case 1:
@@ -562,6 +616,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             bool alias = (fuzz_data[0] % 2) == 1;
             fuzz_section->type = "interface";
             config_parse_interface(fuzz_section, alias);
+            fuzz_section->type = original_type; // Restore
             break;
         }
         case 4: {
@@ -580,30 +635,36 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             break;
     }
 
+cleanup:
+    // Clean up interface
     if (fuzz_iface) {
+        // Clean up any errors that might have been added
         struct interface_error *error, *tmp;
         list_for_each_entry_safe(error, tmp, &fuzz_iface->errors, list) {
             list_del(&error->list);
             free(error);
         }
-        // Free the fuzzed interface name if it was allocated
-        if (fuzz_iface->name && strcmp(fuzz_iface->name, "eth0") != 0) {
+        // Always free the name since it was allocated with strdup() or malloc()
+        if (fuzz_iface->name) {
             free((void*)fuzz_iface->name);
         }
         free(fuzz_iface);
     }
     
+    // Clean up section
     if (fuzz_section) {
-        // Free the fuzzed section type and name if they were allocated
-        if (fuzz_section->type && strcmp(fuzz_section->type, "interface") != 0) {
+        // Always free allocated strings - they were created with strdup() or malloc()
+        // IMPORTANT: Do NOT use strcmp here!
+        if (fuzz_section->type) {
             free((void*)fuzz_section->type);
         }
-        if (fuzz_section->e.name && strcmp(fuzz_section->e.name, "lan") != 0) {
+        if (fuzz_section->e.name) {
             free((void*)fuzz_section->e.name);
         }
         free(fuzz_section);
     }
     
+    // Clean up bridge
     if (fuzz_bridge) {
         if (fuzz_bridge->config) {
             free(fuzz_bridge->config);
@@ -627,44 +688,6 @@ static void fuzz_cleanup(void) {
         }
     }
 }
-
-
-// #ifndef __AFL_FUZZ_TESTCASE_LEN
-
-// ssize_t fuzz_len;
-// unsigned char fuzz_buf[1024000];
-
-// #define __AFL_FUZZ_TESTCASE_LEN fuzz_len
-// #define __AFL_FUZZ_TESTCASE_BUF fuzz_buf  
-// #define __AFL_FUZZ_INIT() void sync(void);
-// #define __AFL_LOOP(x) \
-//     ((fuzz_len = read(0, fuzz_buf, sizeof(fuzz_buf))) > 0 ? 1 : 0)
-// #define __AFL_INIT() sync()
-
-// #endif
-
-// __AFL_FUZZ_INIT();
-
-// #pragma clang optimize off
-// #pragma GCC optimize("O0")
-
-// int main(int argc, char **argv)
-// {
-//     (void)argc; (void)argv; 
-    
-//     ssize_t len;
-//     unsigned char *buf;
-
-//     __AFL_INIT();
-//     buf = __AFL_FUZZ_TESTCASE_BUF;
-//     while (__AFL_LOOP(INT_MAX)) {
-//         len = __AFL_FUZZ_TESTCASE_LEN;
-//         LLVMFuzzerTestOneInput(buf, (size_t)len);
-//     }
-    
-//     return 0;
-// }
-
 
 static struct blob_attr *create_blob_from_fuzz_data(const uint8_t *data, size_t size) {
     static struct blob_buf fuzz_buf;
@@ -890,38 +913,38 @@ static void fuzz_bonding_create(const uint8_t *data, size_t size) {
 }
 
 
-#ifndef __AFL_FUZZ_TESTCASE_LEN
+// #ifndef __AFL_FUZZ_TESTCASE_LEN
 
-ssize_t fuzz_len;
-unsigned char fuzz_buf[1024000];
+// ssize_t fuzz_len;
+// unsigned char fuzz_buf[1024000];
 
-#define __AFL_FUZZ_TESTCASE_LEN fuzz_len
-#define __AFL_FUZZ_TESTCASE_BUF fuzz_buf  
-#define __AFL_FUZZ_INIT() void sync(void);
-#define __AFL_LOOP(x) \
-    ((fuzz_len = read(0, fuzz_buf, sizeof(fuzz_buf))) > 0 ? 1 : 0)
-#define __AFL_INIT() sync()
+// #define __AFL_FUZZ_TESTCASE_LEN fuzz_len
+// #define __AFL_FUZZ_TESTCASE_BUF fuzz_buf  
+// #define __AFL_FUZZ_INIT() void sync(void);
+// #define __AFL_LOOP(x) \
+//     ((fuzz_len = read(0, fuzz_buf, sizeof(fuzz_buf))) > 0 ? 1 : 0)
+// #define __AFL_INIT() sync()
 
-#endif
+// #endif
 
-__AFL_FUZZ_INIT();
+// __AFL_FUZZ_INIT();
 
-#pragma clang optimize off
-#pragma GCC optimize("O0")
+// #pragma clang optimize off
+// #pragma GCC optimize("O0")
 
-int main(int argc, char **argv)
-{
-    (void)argc; (void)argv; 
+// int main(int argc, char **argv)
+// {
+//     (void)argc; (void)argv; 
     
-    ssize_t len;
-    unsigned char *buf;
+//     ssize_t len;
+//     unsigned char *buf;
 
-    __AFL_INIT();
-    buf = __AFL_FUZZ_TESTCASE_BUF;
-    while (__AFL_LOOP(INT_MAX)) {
-        len = __AFL_FUZZ_TESTCASE_LEN;
-        LLVMFuzzerTestOneInput(buf, (size_t)len);
-    }
+//     __AFL_INIT();
+//     buf = __AFL_FUZZ_TESTCASE_BUF;
+//     while (__AFL_LOOP(INT_MAX)) {
+//         len = __AFL_FUZZ_TESTCASE_LEN;
+//         LLVMFuzzerTestOneInput(buf, (size_t)len);
+//     }
     
-    return 0;
-}
+//     return 0;
+// }
